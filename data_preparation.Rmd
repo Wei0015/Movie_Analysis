@@ -1,0 +1,176 @@
+---
+title: "data_preparation_script"
+author: "Wei Ding"
+date: "2025-04-15"
+output: html_document
+---
+
+```{r}
+# data_preparation.R
+# This script prepares the data and trains the model locally
+# Run this LOCALLY before deployment to create prediction_results.rds
+
+# Load necessary packages
+library(tidyverse)
+library(recipes)
+library(keras)
+library(tensorflow)
+library(caret)
+library(lubridate)
+
+# 1. Load and sample data
+set.seed(123) # For reproducibility
+df <- read_csv("TMDB_movie_dataset_v11.csv") %>%
+  filter(revenue > 10000, budget > 10000) %>%
+  sample_n(10000) %>%  # Using 10,000 samples as requested
+  mutate(id = row_number())
+
+# 2. Data cleaning function
+clean_data <- function(df) {
+  df %>%
+    mutate(
+      release_date = case_when(
+        str_detect(release_date, "^\\d{4}-\\d{2}-\\d{2}$") ~ ymd(release_date, quiet = TRUE),
+        str_detect(release_date, "^\\d{2}/\\d{2}/\\d{4}$") ~ mdy(release_date, quiet = TRUE),
+        TRUE ~ ymd("2000-01-01")
+      ),
+      revenue = ifelse(is.na(revenue), median(revenue, na.rm = TRUE), revenue),
+      revenue = pmin(pmax(revenue, quantile(revenue, 0.01, na.rm = TRUE)), quantile(revenue, 0.99, na.rm = TRUE)),
+      budget = ifelse(is.na(budget), median(budget, na.rm = TRUE), budget),
+      budget = pmin(pmax(budget, quantile(budget, 0.05, na.rm = TRUE)), quantile(budget, 0.95, na.rm = TRUE)),
+      vote_count = ifelse(is.na(vote_count) | vote_count < 5, 5, vote_count),
+      vote_average = case_when(
+        is.na(vote_average) ~ 5.5,
+        vote_average < 1 ~ 1,
+        vote_average > 10 ~ 10,
+        TRUE ~ vote_average
+      ),
+      runtime = ifelse(is.na(runtime), median(runtime, na.rm = TRUE), runtime),
+      popularity = ifelse(is.na(popularity), median(popularity, na.rm = TRUE), popularity)
+    )
+}
+
+cleaned_df <- clean_data(df)
+
+# 3. Feature engineering function
+preprocess_data <- function(df) {
+  df %>%
+    mutate(
+      release_year = year(release_date),
+      age = 2025 - release_year,
+      log_budget = log1p(budget),
+      log_popularity = log1p(popularity),
+      log_vote_count = log1p(vote_count),
+      budget_per_min = budget / pmax(runtime, 1),
+      main_language = case_when(
+        original_language %in% c('en') ~ 'english',
+        original_language %in% c('ja', 'zh', 'ko') ~ 'asian',
+        original_language %in% c('fr', 'de', 'es', 'it') ~ 'european',
+        TRUE ~ 'other'
+      ),
+      decade = floor(release_year / 10) * 10
+    ) %>%
+    select(log_budget, budget_per_min, log_popularity, runtime, 
+           vote_average, log_vote_count, age, main_language, decade) %>%
+    mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE))))
+}
+
+features <- preprocess_data(cleaned_df)
+target <- log1p(cleaned_df$revenue)
+
+# 4. Preprocess pipeline with recipes
+recipe <- recipe(~ ., data = features) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>%
+  step_normalize(all_numeric()) %>%
+  prep()
+
+preprocessed_data <- bake(recipe, new_data = features)
+
+# 5. Train-test split (stratified)
+set.seed(42)
+revenue_bins <- cut(target, breaks = 5)
+train_index <- createDataPartition(revenue_bins, p = 0.8, list = FALSE)
+x_train <- preprocessed_data[train_index, ]
+x_test <- preprocessed_data[-train_index, ]
+y_train <- target[train_index]
+y_test <- target[-train_index]
+
+# 6. Keras model architecture
+build_model <- function(input_shape) {
+  keras_model_sequential() %>%
+    layer_dense(units = 64, activation = "relu", input_shape = input_shape,
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 32, activation = "relu",
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dense(units = 1) %>%
+    compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      loss = "mse",
+      metrics = c("mae", "mse")
+    )
+}
+
+# 7. Model training
+model <- build_model(ncol(x_train))
+
+history <- model %>% fit(
+  x = as.matrix(x_train),
+  y = y_train,
+  epochs = 150,
+  batch_size = 64,
+  validation_split = 0.2,
+  callbacks = list(
+    callback_early_stopping(monitor = "val_loss", patience = 15, restore_best_weights = TRUE),
+    callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 5, min_lr = 1e-6)
+  ),
+  verbose = 1
+)
+
+# 8. Predict and prepare data for plotting
+predictions <- model %>% predict(as.matrix(x_test)) %>% as.vector()
+actual <- y_test
+
+# 9. Create and save the results dataframe for Shiny
+error_df <- data.frame(
+  actual = expm1(actual),
+  predicted = expm1(predictions),
+  revenue_group = cut(expm1(actual),
+                     breaks = c(0, 1e6, 1e7, 5e7, 1e8, 1e9, Inf),
+                     labels = c("<1M", "1-10M", "10-50M", "50-100M", "100M-1B", ">1B"))
+)
+
+# Calculate aggregate metrics to include in the app
+model_metrics <- list(
+  r_squared = cor(predictions, actual)^2,
+  mape = mean(abs((expm1(predictions) - expm1(actual)) / expm1(actual)) * 100),
+  mae = mean(abs(expm1(predictions) - expm1(actual))),
+  group_metrics = error_df %>%
+    group_by(revenue_group) %>%
+    summarize(
+      mean_error_pct = mean(abs(predicted - actual) / actual * 100),
+      count = n()
+    ) %>%
+    as.data.frame()
+)
+
+# 10. Save only the essential results needed for visualization
+# This dramatically reduces the deployment size
+saveRDS(list(
+  error_df = error_df,
+  metrics = model_metrics
+), "prediction_results.rds")
+
+# Optional: You could also save some sample data for the dashboard
+sampled_movies <- cleaned_df %>%
+  select(title, release_date, revenue, budget, vote_average, runtime) %>%
+  sample_n(50)
+saveRDS(sampled_movies, "sample_movies.rds")
+
+print("Data preparation complete. You can now deploy the app.R file.")
+```
+
