@@ -1,0 +1,258 @@
+---
+title: "extra_credit"
+author: "Wei Ding"
+date: "2025-04-14"
+output: html_document
+---
+# 
+```{r}
+# load necessary packages
+library(tidyverse)
+library(recipes)
+library(keras)
+library(tensorflow)
+library(caret)
+library(lubridate)
+
+# 1. load and sample data as before
+df <- read_csv("TMDB_movie_dataset_v11.csv") %>%
+  filter(revenue > 10000, budget > 10000) %>%
+  sample_n(min(8000, nrow(.))) %>%
+  mutate(id = row_number())
+
+# 2. data cleaning function
+clean_data <- function(df) {
+  df %>%
+    mutate(
+      release_date = case_when(
+        str_detect(release_date, "^\\d{4}-\\d{2}-\\d{2}$") ~ ymd(release_date, quiet = TRUE),
+        str_detect(release_date, "^\\d{2}/\\d{2}/\\d{4}$") ~ mdy(release_date, quiet = TRUE),
+        TRUE ~ ymd("2000-01-01")
+      ),
+      revenue = ifelse(is.na(revenue), median(revenue, na.rm = TRUE), revenue),
+      revenue = pmin(pmax(revenue, quantile(revenue, 0.01, na.rm = TRUE)), quantile(revenue, 0.99, na.rm = TRUE)),
+      budget = ifelse(is.na(budget), median(budget, na.rm = TRUE), budget),
+      budget = pmin(pmax(budget, quantile(budget, 0.05, na.rm = TRUE)), quantile(budget, 0.95, na.rm = TRUE)),
+      vote_count = ifelse(is.na(vote_count) | vote_count < 5, 5, vote_count),
+      vote_average = case_when(
+        is.na(vote_average) ~ 5.5,
+        vote_average < 1 ~ 1,
+        vote_average > 10 ~ 10,
+        TRUE ~ vote_average
+      ),
+      runtime = ifelse(is.na(runtime), median(runtime, na.rm = TRUE), runtime),
+      popularity = ifelse(is.na(popularity), median(popularity, na.rm = TRUE), popularity)
+    )
+}
+
+cleaned_df <- clean_data(df)
+
+# 3. feature engineering function
+preprocess_data <- function(df) {
+  df %>%
+    mutate(
+      release_year = year(release_date),
+      age = 2025 - release_year,
+      log_budget = log1p(budget),
+      log_popularity = log1p(popularity),
+      log_vote_count = log1p(vote_count),
+      budget_per_min = budget / pmax(runtime, 1),
+      main_language = case_when(
+        original_language %in% c('en') ~ 'english',
+        original_language %in% c('ja', 'zh', 'ko') ~ 'asian',
+        original_language %in% c('fr', 'de', 'es', 'it') ~ 'european',
+        TRUE ~ 'other'
+      ),
+      decade = floor(release_year / 10) * 10
+    ) %>%
+    select(log_budget, budget_per_min, log_popularity, runtime, 
+           vote_average, log_vote_count, age, main_language, decade) %>%
+    mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE))))
+}
+
+features <- preprocess_data(cleaned_df)
+target <- log1p(cleaned_df$revenue)
+
+# 4. preprocess pipeline with recipes
+recipe <- recipe(~ ., data = features) %>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>%
+  step_normalize(all_numeric()) %>%
+  prep()
+
+preprocessed_data <- bake(recipe, new_data = features)
+
+# 5. train-test split (stratified)
+set.seed(42)
+revenue_bins <- cut(target, breaks = 5)
+train_index <- createDataPartition(revenue_bins, p = 0.8, list = FALSE)
+x_train <- preprocessed_data[train_index, ]
+x_test <- preprocessed_data[-train_index, ]
+y_train <- target[train_index]
+y_test <- target[-train_index]
+
+# 6. conduct keras model architecture
+build_model <- function(input_shape) {
+  keras_model_sequential() %>%
+    layer_dense(units = 64, activation = "relu", input_shape = input_shape,
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 32, activation = "relu",
+                kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dense(units = 1) %>%
+    compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      loss = "mse",
+      metrics = c("mae", "mse")
+    )
+}
+
+# 7. model training
+model <- build_model(ncol(x_train))
+
+history <- model %>% fit(
+  x = as.matrix(x_train),
+  y = y_train,
+  epochs = 150,
+  batch_size = 64,
+  validation_split = 0.2,
+  callbacks = list(
+    callback_early_stopping(monitor = "val_loss", patience = 15, restore_best_weights = TRUE),
+    callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 5, min_lr = 1e-6)
+  ),
+  verbose = 1
+)
+
+# 8. predict and prepare data for plotting (used in Shiny)
+predictions <- model %>% predict(as.matrix(x_test)) %>% as.vector()
+actual <- y_test
+
+```
+```{r}
+library(shiny)
+library(shinythemes)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(plotly)
+
+# use previously computed predictions and actual values
+error_df <- data.frame(
+  actual = expm1(actual),
+  predicted = expm1(predictions),
+  revenue_group = cut(expm1(actual),
+                      breaks = c(0, 1e6, 1e7, 5e7, 1e8, 1e9, Inf),
+                      labels = c("<1M", "1-10M", "10-50M", "50-100M", "100M-1B", ">1B"))
+)
+
+# UI
+ui <- navbarPage(
+  title = "Movie Revenue Prediction & Recommender System Dashboard",
+  theme = shinytheme("cosmo"),
+
+  # Page 1: Summary
+  tabPanel("Summary",
+           fluidPage(
+             titlePanel("Movie Analysis Summary"),
+             fluidRow(
+               column(12,
+                      h4("Background:
+The movie industry plays an important role in the cultural and economic aspects of the world. We believe that the development of movies can influence or show the trends of the world. With the advancements in technology, users can go to media and search for any movies they want. However, researchers, film companies, and users face challenges when they create a movie and search for movies. These challenges are, how to predict the revenue of movies; which kinds of movies would have a high probability of success at the box office; and if users explore the streaming media, how the algorithm behind the website recommends movies for them. Therefore, based on these problems, we build a multiplayer perceptron (MLP) neural network to predict the film's revenue. And implement content-based filtering to recommend movies for users based on similar overviews or plots of movies."),
+                      p("Methods:
+In this project, we created a multilayer perceptron (MLP) neural network to predict revenue. Since the TMDB movie dataset that we found from Kaggle is huge, we randomly extracted 8,000 samples from the dataset and applied them to our analysis. During the training process, we optimized our MLP by using regularization, dropout, and learning rate scheduling. Users can use TF-IDF vectorization and cosine similarity over combined text fields (overview, genres, and keywords). The content-based filtering method had been used to find thematically similar films. The recommendation system was built manually using Python. But a little bit different with the collaborative filtering we discussed in the class. When it comes to movie suggestions, content-based filtering implies recommending films that are comparable to ones that a user has already enjoyed by looking at elements like genre, actors, director, and narrative summaries."),
+                      p("Findings:
+Our revenue prediction model had an R² of 0.6446 and a MAPE of 7.12%, with a 4.9% error for high-budget films ($100M–$1B), and 14.4% for low-budget films (<$1M). These results indicate the model performed well on more tightly organized, bigstudio efforts. Moreover, the recommendations performed moderately well in generating suggestions. For example,  if the user typed in “Inception”, the system would list other similar film names. The algorithms behind the system are based on genres or keywords. Our results would show each recommended movies' similarity scores (0.07 – 0.18)."),
+                      p("Conclusions:
+Our analysis shows that machine learning techniques can be used to solve two main problems in movie industries: predicting box office and improving user experience in streaming media (better recommender system). Our project still has limitations. For example, we were not using all the data in the original dataset. In the future, we will compare another method to predict movie revenue, for example, deep neural networks with CNN. For the recommender system, we will combine user behavior data and other filtering methods to improve the efficiency of the recommender system."),
+                      br(),
+                      p("* A recommender system, or a recommendation system, sometimes only called 'the algorithm' or 'algorithm' is a subclass of information filtering system that provides suggestions for items that are most pertinent to a particular user.
+                        The second tab includes an interactive scatter plot to explore how well the model predicted revenue across various scales.")
+               )
+             )
+           )
+  ),
+
+  # Page 2: Interactive Plot
+  tabPanel("Actual vs Predicted",
+           fluidPage(
+             titlePanel("Actual vs. Predicted Revenue"),
+             sidebarLayout(
+               sidebarPanel(
+                 selectInput("group", "Select Revenue Group:",
+                             choices = c("All", levels(error_df$revenue_group)),
+                             selected = "All"),
+                 checkboxInput("log_scale", "Use log scale", TRUE),
+                 br(),
+                 verbatimTextOutput("clickInfo")
+               ),
+               mainPanel(
+                 plotlyOutput("scatterPlot", height = "700px")  # Bigger interactive plot
+               )
+             )
+           )
+  )
+)
+
+# conduct the server
+server <- function(input, output) {
+
+  filtered_data <- reactive({
+    if (input$group == "All") {
+      error_df
+    } else {
+      filter(error_df, revenue_group == input$group)
+    }
+  })
+
+  output$scatterPlot <- renderPlotly({
+    df <- filtered_data()
+    p <- ggplot(df, aes(x = actual, y = predicted, color = revenue_group, text = paste0(
+      "Actual: $", scales::comma(actual),
+      "<br>Predicted: $", scales::comma(predicted),
+      "<br>Group: ", revenue_group
+    ))) +
+      geom_point(alpha = 0.7, size = 3) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+      labs(
+        title = "Actual vs Predicted Revenue",
+        x = "Actual Revenue",
+        y = "Predicted Revenue",
+        color = "Revenue Group"
+      ) +
+      theme_minimal(base_size = 15)
+
+    if (input$log_scale) {
+      p <- p +
+        scale_x_log10(labels = dollar_format(scale = 1e-6, suffix = "M")) +
+        scale_y_log10(labels = dollar_format(scale = 1e-6, suffix = "M"))
+    } else {
+      p <- p +
+        scale_x_continuous(labels = dollar_format(scale = 1e-6, suffix = "M")) +
+        scale_y_continuous(labels = dollar_format(scale = 1e-6, suffix = "M"))
+    }
+
+    ggplotly(p, tooltip = "text") %>% config(displayModeBar = FALSE)
+  })
+
+  output$clickInfo <- renderPrint({
+    d <- event_data("plotly_click")
+    if (is.null(d)) {
+      cat("Click on a point in the scatter plot to view details.")
+    } else {
+      clicked <- d$pointNumber + 1
+      movie <- filtered_data()[clicked, ]
+      cat(paste0(
+        "Clicked Point Details:\n",
+        "Actual Revenue: $", format(round(movie$actual), big.mark = ","), "\n",
+        "Predicted Revenue: $", format(round(movie$predicted), big.mark = ","), "\n",
+        "Revenue Group: ", as.character(movie$revenue_group)
+      ))
+    }
+  })
+}
+
+shinyApp(ui = ui, server = server)
+```
