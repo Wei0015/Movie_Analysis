@@ -1,0 +1,573 @@
+---
+title: "Movie_Analysis_revenue_prediction"
+author: "Wei Ding"
+date: "2025-04-11"
+output: html_document
+---
+# We combined chunks into one cell to makes sure one time run can get all outputs.
+```{r}
+# load necessary packages
+library(tidyverse)
+library(recipes)
+library(keras)
+library(tensorflow)
+library(caret)
+library(lubridate)
+library(ggplot2)
+library(gridExtra)
+library(scales)
+
+# set clearer plotting environment before data preprocessing
+options(repr.plot.width=12, repr.plot.height=10)
+# reset graphics device to ensure display
+if(!is.null(dev.list())) dev.off()
+
+# 1. load the dataset
+df <- read_csv('TMDB_movie_dataset_v11.csv')
+
+# initial filtering - Use 10000 thresholds, suppose all movies we used have budget above 10,000
+# then take a sample of 8000 movies for analysis
+df <- df %>% 
+  filter(revenue > 10000, budget > 10000) %>%
+  # extract 8000 sample size
+  sample_n(min(8000, nrow(.))) %>%
+  mutate(id = row_number())
+
+# 2. Improved Data Cleaning Pipeline
+clean_data <- function(df) {
+  df %>%
+    mutate(
+      # convert release_date to Date format with error handling
+      release_date = case_when(
+        str_detect(release_date, "^\\d{4}-\\d{2}-\\d{2}$") ~ ymd(release_date, quiet = TRUE),
+        str_detect(release_date, "^\\d{2}/\\d{2}/\\d{4}$") ~ mdy(release_date, quiet = TRUE),
+        TRUE ~ ymd("2000-01-01")  # Default for invalid dates
+      ),
+      # use winsorization to handle outliers in revenue by capping at 1st and 99th percentiles
+      revenue = ifelse(is.na(revenue), median(revenue, na.rm = TRUE), revenue),
+      revenue = pmin(pmax(revenue, quantile(revenue, 0.01, na.rm = TRUE)), 
+                    quantile(revenue, 0.99, na.rm = TRUE)),
+      # handle outliers in budget by capping at 5th and 95th percentiles
+      budget = ifelse(is.na(budget), median(budget, na.rm = TRUE), budget),
+      budget = pmin(pmax(budget, quantile(budget, 0.05, na.rm = TRUE)), 
+                   quantile(budget, 0.95, na.rm = TRUE)),
+      # set minimum vote_count to 5 to ensure sufficient ratings
+      vote_count = ifelse(is.na(vote_count) | vote_count < 5, 5, vote_count),
+      vote_average = case_when(
+        # use mean value for missing ratings
+        is.na(vote_average) ~ 5.5,
+        vote_average < 1 ~ 1,
+        vote_average > 10 ~ 10,
+        TRUE ~ vote_average
+      ),
+      # impute missing runtime and popularity with median values
+      runtime = ifelse(is.na(runtime), median(runtime, na.rm = TRUE), runtime),
+      popularity = ifelse(is.na(popularity), median(popularity, na.rm = TRUE), popularity)
+    )
+}
+# apply the cleaning function to the dataset
+cleaned_df <- clean_data(df)
+
+# 3. enhanced feature engineering, create new features that might help predict revenue
+preprocess_data <- function(df) {
+  df %>%
+    mutate(
+      # extract year from release date
+      release_year = lubridate::year(release_date),
+      # calculate movie age relative to 2025
+      age = 2025 - release_year,
+      # log transform skewed features to normalize their distribution
+      log_budget = log1p(budget),
+      log_popularity = log1p(popularity),
+      log_vote_count = log1p(vote_count),
+      # calculate budget per minute as a proxy for production value
+      budget_per_min = budget / pmax(runtime, 1),
+      # group languages into categories for better representation
+      main_language = case_when(
+        original_language %in% c('en') ~ 'english',
+        original_language %in% c('ja', 'zh', 'ko') ~ 'asian',
+        original_language %in% c('fr', 'de', 'es', 'it') ~ 'european',
+        TRUE ~ 'other'
+      ),
+      # create decade feature to capture temporal trends
+      decade = floor(release_year / 10) * 10
+    ) %>%
+    # select only the features we want to use in our model
+    select(log_budget, budget_per_min, log_popularity, runtime, 
+           vote_average, log_vote_count, age, main_language, decade) %>%
+    # replace any remaining NA values with median values
+    mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE))))
+}
+# generate feature set from cleaned data
+features <- preprocess_data(cleaned_df)
+# log transform revenue (target variable) to handle its skewed distribution
+target <- log1p(cleaned_df$revenue)
+
+# print correlation between features and target to understand feature importance
+cor_with_target <- cor(features %>% select(where(is.numeric)), target)
+print("Feature correlations with target:")
+print(cor_with_target[order(abs(cor_with_target), decreasing = TRUE)])
+
+# 4. preprocessing pipeline for model training
+recipe <- recipe(~ ., data = features) %>%
+  # convert categorical variables to dummy variables
+  step_dummy(all_nominal(), one_hot = TRUE) %>%
+  # standardize numeric features for better model convergence
+  step_normalize(all_numeric()) %>%
+  prep()
+# apply preprocessing to feature dataset
+preprocessed_data <- bake(recipe, new_data = features)
+
+# 5. Train-Test Split with Stratification to ensure representative data in both sets
+set.seed(42)
+# stratify by binned revenue levels to ensure similar revenue distributions in train/test sets
+revenue_bins <- cut(target, breaks = 5)
+train_index <- createDataPartition(revenue_bins, p = 0.8, list = FALSE)
+x_train <- preprocessed_data[train_index, ]
+x_test <- preprocessed_data[-train_index, ]
+y_train <- target[train_index]
+y_test <- target[-train_index]
+
+# 6. Build Enhanced Keras Neural Network Model with Regularization techniques
+build_model <- function(input_shape) {
+  keras_model_sequential() %>%
+    # first layer with L2 regularization to prevent overfitting
+    layer_dense(units = 64, activation = "relu", input_shape = input_shape,
+               kernel_regularizer = regularizer_l2(0.001)) %>%
+    # batch normalization to stabilize learning
+    layer_batch_normalization() %>%
+    # dropout for regularization
+    layer_dropout(rate = 0.3) %>%
+    # second hidden layer
+    layer_dense(units = 32, activation = "relu",
+               kernel_regularizer = regularizer_l2(0.001)) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = 0.2) %>%
+    # third hidden layer
+    layer_dense(units = 16, activation = "relu") %>%
+    # output layer (single unit for regression)
+    layer_dense(units = 1) %>%
+    
+    # compile model with optimizer and loss function
+    compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      # mean squared error as loss function
+      loss = "mse",
+      # track both mean absolute error and mean squared error
+      metrics = c("mae", "mse")
+    )
+}
+# create model using the input shape from training data
+model <- build_model(ncol(x_train))
+# print model architecture summary
+summary(model)
+
+# 7. Training with Enhanced Callbacks for better convergence
+history <- model %>% fit(
+  x = as.matrix(x_train),
+  y = y_train,
+  # more epochs with early stopping to find optimal training duration
+  epochs = 150,
+  # use larger batch size for better training efficiency
+  batch_size = 64,
+  # hold out 20% of training data for validation
+  validation_split = 0.2,
+  
+  # callbacks for enhanced training process
+  callbacks = list(
+    # early stopping to prevent overfitting
+    callback_early_stopping(monitor = "val_loss", patience = 15, restore_best_weights = TRUE),
+    # reduce learning rate when plateauing
+    callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 5, min_lr = 1e-6),
+    # log metrics for tensorboard visualization
+    callback_tensorboard(log_dir = file.path(tempdir(), "movie_revenue_logs"))
+  ),
+  # show progress during training
+  verbose = 1
+)
+
+# 8. Improved Evaluation and Visualization
+# 8.1 Create reliable training history plotting function to visualize learning process
+plot_training_history <- function(history) {
+  # convert history object to dataframe for easier plotting
+  metrics_data <- data.frame(
+    epoch = seq_len(length(history$metrics$loss)),
+    loss = history$metrics$loss,
+    val_loss = history$metrics$val_loss,
+    mae = history$metrics$mae,
+    val_mae = history$metrics$val_mae,
+    mse = history$metrics$mse,
+    val_mse = history$metrics$val_mse
+  )
+  
+  # create loss chart comparing training and validation loss
+  p1 <- ggplot(metrics_data, aes(x = epoch)) +
+    geom_line(aes(y = loss, color = "Training"), size = 1.2) +
+    geom_line(aes(y = val_loss, color = "Validation"), size = 1.2) +
+    scale_color_manual(values = c("Training" = "#E74C3C", "Validation" = "#2ECC71")) +
+    labs(title = "Model Loss During Training",
+         x = "Epoch",
+         y = "Loss",
+         color = "Data") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "top")
+  
+ # create MAE chart comparing training and validation mean absolute error
+  p2 <- ggplot(metrics_data, aes(x = epoch)) +
+    geom_line(aes(y = mae, color = "Training"), size = 1.2) +
+    geom_line(aes(y = val_mae, color = "Validation"), size = 1.2) +
+    scale_color_manual(values = c("Training" = "#3498DB", "Validation" = "#9B59B6")) +
+    labs(title = "Mean Absolute Error",
+         x = "Epoch",
+         y = "MAE",
+         color = "Data") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "top")
+  
+  # create MSE chart comparing training and validation mean squared error
+  p3 <- ggplot(metrics_data, aes(x = epoch)) +
+    geom_line(aes(y = mse, color = "Training"), size = 1.2) +
+    geom_line(aes(y = val_mse, color = "Validation"), size = 1.2) +
+    scale_color_manual(values = c("Training" = "#F39C12", "Validation" = "#16A085")) +
+    labs(title = "Mean Squared Error",
+         x = "Epoch",
+         y = "MSE",
+         color = "Data") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "top")
+  
+  # plot learning rate changes over epochs
+  lr_data <- data.frame(
+    epoch = seq_len(length(history$metrics$lr)),
+    lr = history$metrics$lr
+  )
+  
+  p4 <- ggplot(lr_data, aes(x = epoch, y = lr)) +
+    geom_line(color = "#8E44AD", size = 1.2) +
+    labs(title = "Learning Rate Schedule",
+         x = "Epoch",
+         y = "Learning Rate") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "none")
+  
+  # display each chart in sequence to ensure visibility in RStudio
+  print(p1)
+  print(p2)
+  print(p3)
+  print(p4)
+  
+  # save charts to files for report
+  ggsave("training_loss.png", p1, width = 10, height = 6, dpi = 300)
+  ggsave("training_mae.png", p2, width = 10, height = 6, dpi = 300)
+  ggsave("training_mse.png", p3, width = 10, height = 6, dpi = 300)
+  ggsave("learning_rate.png", p4, width = 10, height = 6, dpi = 300)
+  
+  # create and display combined charts grid
+  combined_plot <- grid.arrange(p1, p2, p3, p4, ncol = 2)
+  # display the chart
+  print(combined_plot)
+  
+  # save combined chart
+  ggsave("training_metrics_combined.png", combined_plot, width = 16, height = 12, dpi = 300)
+  # return list of plots for potential further use
+  return(list(loss=p1, mae=p2, mse=p3, lr=p4, combined=combined_plot))
+}
+
+# evaluate model performance on test data
+test_performance <- model %>% evaluate(as.matrix(x_test), y_test, verbose = 0)
+cat(sprintf("\nFinal Test Performance:\nMAE (log scale): %.4f\n", test_performance["mae"]))
+cat(sprintf("RMSE (log scale): %.4f\n", sqrt(test_performance["mse"])))
+# convert log scale error to original dollar scale for better interpretability
+cat(sprintf("MAE (original scale): ±$%.2f million\n", (exp(test_performance["mae"]) - 1)/1000000))
+
+# more detailed error analysis to understand model performance
+predictions <- model %>% predict(as.matrix(x_test)) %>% as.vector()
+actual <- y_test
+
+# calculate error metrics
+error <- actual - predictions
+abs_error <- abs(error)
+# Mean Absolute Percentage Error
+mape <- mean(abs_error / actual) * 100
+# R-squared to measure proportion of variance explained
+r_squared <- 1 - sum((actual - predictions)^2) / sum((actual - mean(actual))^2)
+
+cat(sprintf("\nAdditional Metrics:\nMAPE: %.2f%%\n", mape))
+cat(sprintf("R-squared: %.4f\n", r_squared))
+
+# create dataframe for detailed error analysis
+error_df <- data.frame(
+  actual_log = actual,
+  predicted_log = predictions,
+  # convert log values back to original scale
+  actual = expm1(actual),
+  predicted = expm1(predictions),
+  abs_error = abs_error,
+  rel_error = abs_error / actual
+)
+
+# categorize movies by revenue groups to analyze prediction accuracy across different ranges
+error_df$revenue_group <- cut(error_df$actual, 
+                             breaks = c(0, 1e6, 1e7, 5e7, 1e8, 1e9, Inf),
+                             labels = c("<1M", "1-10M", "10-50M", "50-100M", "100M-1B", ">1B"))
+# calculate error metrics for each revenue group
+group_errors <- error_df %>%
+  group_by(revenue_group) %>%
+  summarise(
+    mean_abs_error_log = mean(abs_error),
+    mean_rel_error = mean(rel_error),
+    count = n()
+  )
+
+cat("\nError Analysis by Revenue Group:\n")
+print(as.data.frame(group_errors))
+
+# 8.2 Add detailed error analysis visualization
+create_error_analysis_plots <- function(error_df, group_errors) {
+  #  bar chart showing absolute error by revenue group
+  p1 <- ggplot(group_errors, aes(x = revenue_group, y = mean_abs_error_log, fill = revenue_group)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.2f", mean_abs_error_log)), 
+              vjust = -0.5, size = 4.5) +
+    scale_fill_brewer(palette = "Blues") +
+    labs(title = "Mean Absolute Error (Log Scale) by Revenue Group",
+         x = "Revenue Group",
+         y = "Mean Absolute Error (Log)",
+         fill = "Revenue Group") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  
+  # bar chart showing relative error by revenue group
+  p2 <- ggplot(group_errors, aes(x = revenue_group, y = mean_rel_error * 100, fill = revenue_group)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.1f%%", mean_rel_error * 100)), 
+              vjust = -0.5, size = 4.5) +
+    scale_fill_brewer(palette = "Greens") +
+    labs(title = "Mean Relative Error by Revenue Group",
+         x = "Revenue Group",
+         y = "Mean Relative Error (%)",
+         fill = "Revenue Group") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  
+  # bar chart showing sample count by revenue group to understand data distribution
+  p3 <- ggplot(group_errors, aes(x = revenue_group, y = count, fill = revenue_group)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = count), vjust = -0.5, size = 4.5) +
+    scale_fill_brewer(palette = "Oranges") +
+    labs(title = "Sample Count by Revenue Group",
+         x = "Revenue Group",
+         y = "Count",
+         fill = "Revenue Group") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  
+  # scatter plot comparing actual vs predicted revenue values
+  p4 <- ggplot(error_df, aes(x = actual, y = predicted)) +
+    # add diagonal line representing perfect prediction
+    geom_point(aes(color = revenue_group), alpha = 0.7, size = 2.5) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "darkgray", size = 1) +
+    # use log scale with dollar formatting for better visualization
+    scale_x_log10(labels = scales::dollar_format(suffix = "M", scale = 1e-6)) +
+    scale_y_log10(labels = scales::dollar_format(suffix = "M", scale = 1e-6)) +
+    scale_color_brewer(palette = "Set1") +
+    labs(title = "Actual vs Predicted Revenue",
+         x = "Actual Revenue (log scale)",
+         y = "Predicted Revenue (log scale)",
+         color = "Revenue Group") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "right")
+  
+  # display each chart in sequence
+  print(p1)
+  print(p2)
+  print(p3)
+  print(p4)
+  
+  # save each chart
+  ggsave("abs_error_by_group.png", p1, width = 10, height = 7, dpi = 300)
+  ggsave("rel_error_by_group.png", p2, width = 10, height = 7, dpi = 300)
+  ggsave("sample_count_by_group.png", p3, width = 10, height = 7, dpi = 300)
+  ggsave("actual_vs_predicted.png", p4, width = 12, height = 9, dpi = 300)
+  
+  # display combined chart
+  combined_error_plot <- grid.arrange(p1, p2, p3, ncol = 3)
+  print(combined_error_plot)
+  
+  # display scatter plot separately (larger size)
+  print(p4 + theme(text = element_text(size = 16)))
+  
+  # save combined charts
+  ggsave("error_analysis_combined.png", combined_error_plot, width = 18, height = 6, dpi = 300)
+  ggsave("large_scatter_plot.png", p4 + theme(text = element_text(size = 18)), width = 16, height = 12, dpi = 300)
+  
+  return(list(abs_error=p1, rel_error=p2, sample_count=p3, scatter=p4))
+}
+
+# 8.3 Create extra-large scatter plot optimized for reports
+create_large_scatter_plot <- function(error_df) {
+  # set clear theme
+  theme_large <- theme_minimal(base_size = 18) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 24, face = "bold"),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text = element_text(size = 16),
+      legend.title = element_text(size = 18),
+      legend.text = element_text(size = 16),
+      legend.key.size = unit(1.5, "cm"),
+      panel.grid.major = element_line(color = "gray85", size = 0.5),
+      panel.grid.minor = element_line(color = "gray95", size = 0.3)
+    )
+  
+  # create larger scatter plot
+  p <- ggplot(error_df, aes(x = actual, y = predicted)) +
+    geom_point(aes(color = revenue_group), alpha = 0.8, size = 3) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "darkgray", size = 1.2) +
+    scale_x_log10(labels = scales::dollar_format(suffix = "M", scale = 1e-6)) +
+    scale_y_log10(labels = scales::dollar_format(suffix = "M", scale = 1e-6)) +
+    scale_color_brewer(palette = "Set1") +
+    labs(title = "Actual vs Predicted Movie Revenue",
+         x = "Actual Revenue (log scale)",
+         y = "Predicted Revenue (log scale)",
+         color = "Revenue Group") +
+    theme_large +
+    # add the diagonal reference line
+    annotate("text", x = 5e6, y = 300e6, 
+             label = "Perfect Prediction Line", 
+             size = 5, color = "darkgray", 
+             angle = 25)
+  
+  # display chart
+  print(p)
+  
+  # save large high-resolution version
+  ggsave("very_large_scatter_plot.png", p, width = 16, height = 14, dpi = 400)
+  
+  # save larger PDF version (suitable for printing)
+  ggsave("scatter_plot_report.pdf", p, width = 12, height = 10, device = cairo_pdf)
+  
+  return(p)
+}
+
+# 8.4 Create visualization of sample predictions to better understand model performance
+create_sample_prediction_plot <- function(sample_indices, x_test, y_test, model) {
+  # sample predictions from test set for visualization
+  sample_indices <- sample(1:nrow(x_test), 5)
+  
+  # create sample prediction dataframe
+  sample_predictions <- data.frame(
+    sample_id = character(),
+    actual = numeric(),
+    predicted = numeric(),
+    error = numeric(),
+    error_percent = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # add prediction results for each sample
+  for (i in 1:length(sample_indices)) {
+    idx <- sample_indices[i]
+    sample <- x_test[idx, , drop = FALSE]
+    pred <- predict(model, as.matrix(sample))[1,1]
+    actual <- y_test[idx]
+    
+    error_abs <- abs(expm1(actual) - expm1(pred))
+    error_percent <- error_abs / expm1(actual) * 100
+    
+    sample_predictions <- rbind(sample_predictions, data.frame(
+      sample_id = paste("Sample", i),
+      # Convert to millions
+      actual = expm1(actual) / 1000000,
+      # Convert to millions
+      predicted = expm1(pred) / 1000000,
+      # Convert to millions
+      error = error_abs / 1000000,
+      error_percent = error_percent
+    ))
+  }
+  
+  # create bar chart comparing actual vs predicted values
+  p1 <- ggplot(sample_predictions, aes(x = sample_id)) +
+    geom_bar(aes(y = actual, fill = "Actual"), stat = "identity", position = "dodge", width = 0.4) +
+    geom_bar(aes(y = predicted, fill = "Predicted"), stat = "identity", position = position_dodge(width = 0.4), width = 0.4) +
+    scale_fill_manual(values = c("Actual" = "#2ECC71", "Predicted" = "#3498DB")) +
+    labs(title = "Actual vs Predicted Revenue for Sample Movies",
+         x = "Sample",
+         y = "Revenue ($ Millions)",
+         fill = "") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 0))
+  
+  # create error percentage bar chart
+  p2 <- ggplot(sample_predictions, aes(x = sample_id, y = error_percent, fill = sample_id)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.1f%%", error_percent)), vjust = -0.5, size = 4.5) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = "Prediction Error Percentage by Sample",
+         x = "Sample",
+         y = "Error Percentage (%)",
+         fill = "Sample") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 0),
+          legend.position = "none")
+  
+  # display charts
+  print(p1)
+  print(p2)
+  
+  # save charts
+  ggsave("sample_comparison.png", p1, width = 10, height = 6, dpi = 300)
+  ggsave("sample_error_percent.png", p2, width = 10, height = 6, dpi = 300)
+  
+  # combined charts
+  combined_samples_plot <- grid.arrange(p1, p2, ncol = 1)
+  print(combined_samples_plot)
+  
+  # save combined chart
+  ggsave("sample_predictions_combined.png", combined_samples_plot, width = 12, height = 12, dpi = 300)
+  
+  return(list(comparison=p1, error=p2, combined=combined_samples_plot))
+}
+
+# print sample predictions with more context
+cat("\nSample Predictions:\n")
+sample_indices <- sample(1:nrow(x_test), 5)
+
+for (i in sample_indices) {
+  sample <- x_test[i, , drop = FALSE]
+  pred <- predict(model, as.matrix(sample))[1,1]
+  actual <- y_test[i]
+  
+  cat(sprintf("True: $%.2f million | Predicted: $%.2f million | Error: $%.2f million (%.1f%%)\n", 
+              expm1(actual)/1000000, expm1(pred)/1000000, 
+              abs(expm1(actual) - expm1(pred))/1000000,
+              abs(expm1(actual) - expm1(pred))/expm1(actual) * 100))
+}
+
+# 9. Apply all visualization functions
+# use improved training history plotting function
+training_plots <- plot_training_history(history)
+
+# use improved error analysis plotting function
+error_plots <- create_error_analysis_plots(error_df, group_errors)
+
+# create extra large scatter plot
+large_scatter <- create_large_scatter_plot(error_df)
+
+# use improved sample prediction plotting function
+samples_plot <- create_sample_prediction_plot(sample_indices, x_test, y_test, model)
+
+# display key evaluation metrics
+cat("\n=== Model Performance Evaluation ===\n")
+cat(sprintf("R-squared: %.4f\n", r_squared))
+cat(sprintf("MAPE: %.2f%%\n", mape))
+cat(sprintf("MAE (log scale): %.4f\n", test_performance["mae"]))
+cat(sprintf("RMSE (log scale): %.4f\n", sqrt(test_performance["mse"])))
+
+# save model for future use
+save_model_tf(model, "movie_revenue_prediction_model")
+cat("\nModel saved as 'movie_revenue_prediction_model'\n")
+```
