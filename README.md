@@ -1,5 +1,5 @@
 # Movie_Analysis
--- The coursework for DS4420. Team member: Wei Ding, Yiming Yuan.
+-- The coursework for DS4420 Machine Learning and Data Mining Advanced Class. Team member: Wei Ding, Yiming Yuan.
 
 Our dataset sourced from Kaggle website:
 https://drive.google.com/drive/folders/1WmMBTFsE_2DasZ8bos5Vgj4TwtO71Fju
@@ -14,4 +14,3 @@ Methods: In this project, we created a multilayer perceptron (MLP) neural netw
 Findings: Our revenue prediction model had an R² of 0.6446 and a MAPE of 7.12%, with a 4.9% error for high-budget films ($100M–$1B), and 14.4% for low-budget films (<$1M). These results indicate the model performed well on more tightly organized, bigstudio efforts. Moreover, the recommendations performed moderately well in generating suggestions. For example, if the user typed in “Inception”, the system would list other similar film names. The algorithms behind the system are based on genres or keywords. Our results would show each recommended movies' similarity scores (0.07 – 0.18).
 
 Conclusions: Our analysis shows that machine learning techniques can be used to solve two main problems in movie industries: predicting box office and improving user experience in streaming media (better recommender system). Our project still has limitations. For example, we were not using all the data in the original dataset. In the future, we will compare another method to predict movie revenue, for example, deep neural networks with CNN. For the recommender system, we will combine user behavior data and other filtering methods to improve the efficiency of the recommender system.
-
